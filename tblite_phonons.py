@@ -30,12 +30,15 @@ def main():
 
     supercells = phonon_driver.supercells_with_displacements
 
-    phonon_driver.forces = get_displacement_forces(supercells)
+    phonon_driver.forces = get_displacement_forces(
+        supercells,
+        accuracy=args.accuracy)
     phonon_driver.produce_force_constants()
 
     phonon_driver.save(settings={'force_constants': True})
 
-def get_displacement_forces(supercells: Sequence[PhonopyAtoms]) -> np.ndarray:
+def get_displacement_forces(supercells: Sequence[PhonopyAtoms],
+                            accuracy: float = 0.1) -> np.ndarray:
     all_forces = []
     from ase import Atoms
 
@@ -45,7 +48,7 @@ def get_displacement_forces(supercells: Sequence[PhonopyAtoms]) -> np.ndarray:
                   cell=supercells[0].cell,
                   scaled_positions=supercells[0].scaled_positions,
                   pbc=True)
-    atoms.calc = TBLite(method="GFN2-xTB", accuracy=0.1)
+    atoms.calc = TBLite(method="GFN2-xTB", accuracy=accuracy)
 
     for i, displacement in enumerate(supercells):
         print(f"Calculating displacement {i} / {len(supercells)}...")
