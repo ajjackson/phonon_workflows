@@ -4,7 +4,11 @@ from argparse import ArgumentParser
 from pathlib import Path
 from typing import List, Sequence
 
+from ase import Atoms
+from ase.build import make_supercell
 import ase.io
+# from ase.constraints import UnitCellFilter
+from ase.geometry import get_duplicate_atoms
 from ase.optimize import LBFGS
 from ase.spacegroup.symmetrize import check_symmetry, FixSymmetry, refine_symmetry
 import numpy as np
@@ -14,15 +18,45 @@ from tblite.ase import TBLite
 
 def main():
     args = get_parser().parse_args()
+    tblite_kwargs = dict(method=args.method, accuracy=args.accuracy)
 
     atoms = ase.io.read(args.structure)
 
     refine_symmetry(atoms, verbose=True)
 
-    atoms.calc = TBLite(method="GFN2-xTB", accuracy=args.accuracy)
+    atoms.calc = TBLite(**tblite_kwargs)
     optimize_atoms(atoms, fmax=args.fmax)
 
     supercell_matrix = get_supercell_matrix(args)
+
+    if args.opt_sc:
+        supercell = make_supercell(atoms, supercell_matrix)
+        supercell.calc = TBLite(**tblite_kwargs)
+        optimize_atoms(supercell, fmax=args.fmax, write=False, adjust_cell=False)
+        optimize_atoms(supercell, fmax=args.fmax, write=False, adjust_cell=True)
+
+        # Fold supercell back onto unit cell
+        opt_cell = np.linalg.solve(supercell_matrix, supercell.cell.array)
+        folded_atoms = supercell.copy()
+        folded_atoms.set_constraint()  # Remove symmetry constraint before deleting things
+        folded_atoms.set_cell(opt_cell, scale_atoms=False)
+        folded_atoms.wrap()
+
+        # Take average positions
+        duplicates = get_duplicate_atoms(folded_atoms, delete=False)
+        while duplicates.any():
+            active_index = duplicates[0, 0]
+            images = duplicates[duplicates[:, 0]==active_index][:, 1].tolist()
+
+            folded_atoms[active_index].position = np.mean(folded_atoms.positions[images + [active_index]], axis=0)
+            print("Removing duplicate atoms", images)
+
+            del folded_atoms[images]
+
+            duplicates = get_duplicate_atoms(folded_atoms, delete=False)
+
+        atoms = folded_atoms
+
     phonon_driver = setup_phonopy(
         atoms,
         supercell_matrix,
@@ -38,9 +72,8 @@ def main():
     phonon_driver.save(settings={'force_constants': True})
 
 def get_displacement_forces(supercells: Sequence[PhonopyAtoms],
-                            accuracy: float = 0.1) -> np.ndarray:
+                            **tblite_kwargs) -> np.ndarray:
     all_forces = []
-    from ase import Atoms
 
     # Set up structure/calculator using first displacement; this
     # will be mutated to perform other displements efficiently
@@ -48,10 +81,10 @@ def get_displacement_forces(supercells: Sequence[PhonopyAtoms],
                   cell=supercells[0].cell,
                   scaled_positions=supercells[0].scaled_positions,
                   pbc=True)
-    atoms.calc = TBLite(method="GFN2-xTB", accuracy=accuracy)
+    atoms.calc = TBLite(**tblite_kwargs)
 
     for i, displacement in enumerate(supercells):
-        print(f"Calculating displacement {i} / {len(supercells)}...")
+        print(f"Calculating displacement {i+1} / {len(supercells)} ...")
         atoms.set_scaled_positions(displacement.scaled_positions)
         forces = atoms.get_forces()
         all_forces.append(forces.tolist())
@@ -90,12 +123,16 @@ def setup_phonopy(atoms, supercell_matrix, guess_primitive=True, distance=0.01):
     phonon.generate_displacements(distance=distance)
     return phonon
 
-def optimize_atoms(atoms, fmax=1e-4):
-    atoms.set_constraint(FixSymmetry(atoms))
+def optimize_atoms(atoms: Atoms,
+                   fmax: float = 1e-4,
+                   write: bool = True,
+                   adjust_cell: bool = True) -> None:
+    atoms.set_constraint(FixSymmetry(atoms, adjust_cell=adjust_cell))
     dyn = LBFGS(atoms)
     dyn.run(fmax=fmax)
 
-    atoms.write('optimized.extxyz')
+    if write:
+        atoms.write('optimized.extxyz')
 
 
 def get_parser() -> ArgumentParser:
@@ -109,6 +146,10 @@ def get_parser() -> ArgumentParser:
                         help='Finite displacement size')
     parser.add_argument('--fmax', type=float, default=1e-4,
                         help='Force convergence target for geometry optimisation')
+    parser.add_argument('--method', type=str, default='GFN2-xTB',
+                        help='Force convergence target for geometry optimisation')
+    parser.add_argument('--opt-sc', action='store_true', dest='opt_sc',
+                        help='Geometry-optimise supercell and fold to primitive')
     return parser
 
 if __name__ == '__main__':
